@@ -379,6 +379,9 @@ class JointText2Wav(AbsGANTTS):
                 - optim_idx (int): Optimizer index (0 for G and 1 for D).
 
         """
+        iiter = kwargs.pop('iter', 10000)
+        print('self.lambda_text2mel:', iiter, self.lambda_text2mel)
+
         if forward_generator:
             return self._forward_generator(
                 text=text,

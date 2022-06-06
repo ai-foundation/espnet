@@ -255,9 +255,21 @@ class Trainer:
             )
         else:
             train_summary_writer = None
+           
+        dropout_modules = [(module, module.p) for module in dp_model.modules() if isinstance(module, torch.nn.Dropout) and module.p != 0]
 
         start_time = time.perf_counter()
         for iepoch in range(start_epoch, trainer_options.max_epoch + 1):
+            
+            if iepoch == 1:
+                for m, p in dropout_modules:
+                    m.p = 0
+                    
+            elif 2 < iepoch <= 12:
+                for m, p in dropout_modules:
+                    if m.p < p:
+                        m.p = min(m.p + 0.05, p)
+            
             if iepoch != start_epoch:
                 logging.info(
                     "{}/{}epoch started. Estimated time to finish: {}".format(
@@ -287,28 +299,29 @@ class Trainer:
                     summary_writer=train_summary_writer,
                     options=trainer_options,
                     distributed_option=distributed_option,
+                    epoch=iepoch
                 )
 
-            with reporter.observe("valid") as sub_reporter:
-                cls.validate_one_epoch(
-                    model=dp_model,
-                    iterator=valid_iter_factory.build_iter(iepoch),
-                    reporter=sub_reporter,
-                    options=trainer_options,
-                    distributed_option=distributed_option,
-                )
-            if not distributed_option.distributed or distributed_option.dist_rank == 0:
-                # att_plot doesn't support distributed
-                if plot_attention_iter_factory is not None:
-                    with reporter.observe("att_plot") as sub_reporter:
-                        cls.plot_attention(
-                            model=model,
-                            output_dir=output_dir / "att_ws",
-                            summary_writer=train_summary_writer,
-                            iterator=plot_attention_iter_factory.build_iter(iepoch),
-                            reporter=sub_reporter,
-                            options=trainer_options,
-                        )
+            # with reporter.observe("valid") as sub_reporter:
+            #     cls.validate_one_epoch(
+            #         model=dp_model,
+            #         iterator=valid_iter_factory.build_iter(iepoch),
+            #         reporter=sub_reporter,
+            #         options=trainer_options,
+            #         distributed_option=distributed_option,
+            #     )
+            # if not distributed_option.distributed or distributed_option.dist_rank == 0:
+            #     # att_plot doesn't support distributed
+            #     if plot_attention_iter_factory is not None:
+            #         with reporter.observe("att_plot") as sub_reporter:
+            #             cls.plot_attention(
+            #                 model=model,
+            #                 output_dir=output_dir / "att_ws",
+            #                 summary_writer=train_summary_writer,
+            #                 iterator=plot_attention_iter_factory.build_iter(iepoch),
+            #                 reporter=sub_reporter,
+            #                 options=trainer_options,
+            #             )
 
             # 2. LR Scheduler step
             for scheduler in schedulers:
@@ -335,128 +348,142 @@ class Trainer:
                     reporter.wandb_log()
 
                 # 4. Save/Update the checkpoint
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "reporter": reporter.state_dict(),
-                        "optimizers": [o.state_dict() for o in optimizers],
-                        "schedulers": [
-                            s.state_dict() if s is not None else None
-                            for s in schedulers
-                        ],
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                    },
-                    output_dir / "checkpoint.pth",
-                )
+                # torch.save(
+                #     {
+                #         "model": model.state_dict(),
+                #         "reporter": reporter.state_dict(),
+                #         "optimizers": [o.state_dict() for o in optimizers],
+                #         "schedulers": [
+                #             s.state_dict() if s is not None else None
+                #             for s in schedulers
+                #         ],
+                #         "scaler": scaler.state_dict() if scaler is not None else None,
+                #     },
+                #     output_dir / "checkpoint.pth",
+                # )
 
                 # 5. Save and log the model and update the link to the best model
-                torch.save(model.state_dict(), output_dir / f"{iepoch}epoch.pth")
+                # torch.save(model.state_dict(), output_dir / f"{iepoch}epoch.pth")
+
+                if iepoch <= 5:
+                    interv = 1
+                elif iepoch < 20:
+                    interv = 5
+                elif iepoch < 50:
+                    interv = 10
+                else:
+                    interv = 25
+                    
+                if iepoch % interv == 0:
+                    p = output_dir / "intervals"
+                    p.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), p / f"{iepoch}epoch.pth")
 
                 # Creates a sym link latest.pth -> {iepoch}epoch.pth
-                p = output_dir / "latest.pth"
-                if p.is_symlink() or p.exists():
-                    p.unlink()
-                p.symlink_to(f"{iepoch}epoch.pth")
+        #         p = output_dir / "latest.pth"
+        #         if p.is_symlink() or p.exists():
+        #             p.unlink()
+        #         p.symlink_to(f"{iepoch}epoch.pth")
 
-                _improved = []
-                for _phase, k, _mode in trainer_options.best_model_criterion:
-                    # e.g. _phase, k, _mode = "train", "loss", "min"
-                    if reporter.has(_phase, k):
-                        best_epoch = reporter.get_best_epoch(_phase, k, _mode)
-                        # Creates sym links if it's the best result
-                        if best_epoch == iepoch:
-                            p = output_dir / f"{_phase}.{k}.best.pth"
-                            if p.is_symlink() or p.exists():
-                                p.unlink()
-                            p.symlink_to(f"{iepoch}epoch.pth")
-                            _improved.append(f"{_phase}.{k}")
-                if len(_improved) == 0:
-                    logging.info("There are no improvements in this epoch")
-                else:
-                    logging.info(
-                        "The best model has been updated: " + ", ".join(_improved)
-                    )
+        #         _improved = []
+        #         for _phase, k, _mode in trainer_options.best_model_criterion:
+        #             # e.g. _phase, k, _mode = "train", "loss", "min"
+        #             if reporter.has(_phase, k):
+        #                 best_epoch = reporter.get_best_epoch(_phase, k, _mode)
+        #                 # Creates sym links if it's the best result
+        #                 if best_epoch == iepoch:
+        #                     p = output_dir / f"{_phase}.{k}.best.pth"
+        #                     if p.is_symlink() or p.exists():
+        #                         p.unlink()
+        #                     p.symlink_to(f"{iepoch}epoch.pth")
+        #                     _improved.append(f"{_phase}.{k}")
+        #         if len(_improved) == 0:
+        #             logging.info("There are no improvements in this epoch")
+        #         else:
+        #             logging.info(
+        #                 "The best model has been updated: " + ", ".join(_improved)
+        #             )
 
-                log_model = (
-                    trainer_options.wandb_model_log_interval > 0
-                    and iepoch % trainer_options.wandb_model_log_interval == 0
-                )
-                if log_model and trainer_options.use_wandb:
-                    import wandb
+        #         log_model = (
+        #             trainer_options.wandb_model_log_interval > 0
+        #             and iepoch % trainer_options.wandb_model_log_interval == 0
+        #         )
+        #         if log_model and trainer_options.use_wandb:
+        #             import wandb
 
-                    logging.info("Logging Model on this epoch :::::")
-                    artifact = wandb.Artifact(
-                        name=f"model_{wandb.run.id}",
-                        type="model",
-                        metadata={"improved": _improved},
-                    )
-                    artifact.add_file(str(output_dir / f"{iepoch}epoch.pth"))
-                    aliases = [
-                        f"epoch-{iepoch}",
-                        "best" if best_epoch == iepoch else "",
-                    ]
-                    wandb.log_artifact(artifact, aliases=aliases)
+        #             logging.info("Logging Model on this epoch :::::")
+        #             artifact = wandb.Artifact(
+        #                 name=f"model_{wandb.run.id}",
+        #                 type="model",
+        #                 metadata={"improved": _improved},
+        #             )
+        #             artifact.add_file(str(output_dir / f"{iepoch}epoch.pth"))
+        #             aliases = [
+        #                 f"epoch-{iepoch}",
+        #                 "best" if best_epoch == iepoch else "",
+        #             ]
+        #             wandb.log_artifact(artifact, aliases=aliases)
 
-                # 6. Remove the model files excluding n-best epoch and latest epoch
-                _removed = []
-                # Get the union set of the n-best among multiple criterion
-                nbests = set().union(
-                    *[
-                        set(reporter.sort_epochs(ph, k, m)[: max(keep_nbest_models)])
-                        for ph, k, m in trainer_options.best_model_criterion
-                        if reporter.has(ph, k)
-                    ]
-                )
+        #         # 6. Remove the model files excluding n-best epoch and latest epoch
+        #         _removed = []
+        #         # Get the union set of the n-best among multiple criterion
+        #         nbests = set().union(
+        #             *[
+        #                 set(reporter.sort_epochs(ph, k, m)[: max(keep_nbest_models)])
+        #                 for ph, k, m in trainer_options.best_model_criterion
+        #                 if reporter.has(ph, k)
+        #             ]
+        #         )
 
-                # Generated n-best averaged model
-                if (
-                    trainer_options.nbest_averaging_interval > 0
-                    and iepoch % trainer_options.nbest_averaging_interval == 0
-                ):
-                    average_nbest_models(
-                        reporter=reporter,
-                        output_dir=output_dir,
-                        best_model_criterion=trainer_options.best_model_criterion,
-                        nbest=keep_nbest_models,
-                        suffix=f"till{iepoch}epoch",
-                    )
+        #         # Generated n-best averaged model
+        #         if (
+        #             trainer_options.nbest_averaging_interval > 0
+        #             and iepoch % trainer_options.nbest_averaging_interval == 0
+        #         ):
+        #             average_nbest_models(
+        #                 reporter=reporter,
+        #                 output_dir=output_dir,
+        #                 best_model_criterion=trainer_options.best_model_criterion,
+        #                 nbest=keep_nbest_models,
+        #                 suffix=f"till{iepoch}epoch",
+        #             )
 
-                for e in range(1, iepoch):
-                    p = output_dir / f"{e}epoch.pth"
-                    if p.exists() and e not in nbests:
-                        p.unlink()
-                        _removed.append(str(p))
-                if len(_removed) != 0:
-                    logging.info("The model files were removed: " + ", ".join(_removed))
+        #         for e in range(1, iepoch):
+        #             p = output_dir / f"{e}epoch.pth"
+        #             if p.exists() and e not in nbests:
+        #                 p.unlink()
+        #                 _removed.append(str(p))
+        #         if len(_removed) != 0:
+        #             logging.info("The model files were removed: " + ", ".join(_removed))
 
-            # 7. If any updating haven't happened, stops the training
-            if all_steps_are_invalid:
-                logging.warning(
-                    f"The gradients at all steps are invalid in this epoch. "
-                    f"Something seems wrong. This training was stopped at {iepoch}epoch"
-                )
-                break
+        #     # 7. If any updating haven't happened, stops the training
+        #     if all_steps_are_invalid:
+        #         logging.warning(
+        #             f"The gradients at all steps are invalid in this epoch. "
+        #             f"Something seems wrong. This training was stopped at {iepoch}epoch"
+        #         )
+        #         break
 
-            # 8. Check early stopping
-            if trainer_options.patience is not None:
-                if reporter.check_early_stopping(
-                    trainer_options.patience, *trainer_options.early_stopping_criterion
-                ):
-                    break
+        #     # 8. Check early stopping
+        #     if trainer_options.patience is not None:
+        #         if reporter.check_early_stopping(
+        #             trainer_options.patience, *trainer_options.early_stopping_criterion
+        #         ):
+        #             break
 
-        else:
-            logging.info(
-                f"The training was finished at {trainer_options.max_epoch} epochs "
-            )
+        # else:
+        #     logging.info(
+        #         f"The training was finished at {trainer_options.max_epoch} epochs "
+        #     )
 
-        # Generated n-best averaged model
-        if not distributed_option.distributed or distributed_option.dist_rank == 0:
-            average_nbest_models(
-                reporter=reporter,
-                output_dir=output_dir,
-                best_model_criterion=trainer_options.best_model_criterion,
-                nbest=keep_nbest_models,
-            )
+        # # Generated n-best averaged model
+        # if not distributed_option.distributed or distributed_option.dist_rank == 0:
+        #     average_nbest_models(
+        #         reporter=reporter,
+        #         output_dir=output_dir,
+        #         best_model_criterion=trainer_options.best_model_criterion,
+        #         nbest=keep_nbest_models,
+        #     )
 
     @classmethod
     def train_one_epoch(
@@ -470,6 +497,7 @@ class Trainer:
         summary_writer,
         options: TrainerOptions,
         distributed_option: DistributedOption,
+        epoch = 0 ,
     ) -> bool:
         assert check_argument_types()
 

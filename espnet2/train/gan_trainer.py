@@ -85,9 +85,11 @@ class GANTrainer(Trainer):
         summary_writer,
         options: GANTrainerOptions,
         distributed_option: DistributedOption,
+        epoch = 0 
     ) -> bool:
         """Train one epoch."""
         assert check_argument_types()
+        failed = False
 
         grad_noise = options.grad_noise
         accum_grad = options.accum_grad
@@ -127,6 +129,10 @@ class GANTrainer(Trainer):
         for iiter, (_, batch) in enumerate(
             reporter.measure_iter_time(iterator, "iter_time"), 1
         ):
+            if failed == True:
+                failed = False
+                continue
+                
             assert isinstance(batch, dict), type(batch)
 
             if distributed:
@@ -145,9 +151,24 @@ class GANTrainer(Trainer):
             else:
                 turns = ["discriminator", "generator"]
             for turn in turns:
+                if failed:
+                    failed = False
+                    print('166 failed! skipping this iteration')
+                    continue
                 with autocast(scaler is not None):
                     with reporter.measure_time(f"{turn}_forward_time"):
-                        retval = model(forward_generator=turn == "generator", **batch)
+                        batch['iter'] = (epoch - 1) * 100 + iiter
+                        try:
+                            retval = model(forward_generator=turn == "generator", **batch)
+                        except RuntimeError as e:
+                            for iopt, optimizer in enumerate(optimizers):
+                                optimizer.zero_grad()
+                            torch.cuda.empty_cache()
+                            failed = True
+                            model.tts._cache = None # reset cache
+                            print('179 failed! skipping this iteration')
+                            continue
+                            # raise e
 
                         # Note(kamo):
                         # Supporting two patterns for the returned value from the model
@@ -210,81 +231,91 @@ class GANTrainer(Trainer):
                         # for corresponding forward ops.
                         scaler.scale(loss).backward()
                     else:
-                        loss.backward()
+                        try:
+                            loss.backward()
+                        except RuntimeError as e:
+                            for iopt, optimizer in enumerate(optimizers):
+                                optimizer.zero_grad()
+                            torch.cuda.empty_cache()
+                            failed = True
+                            model.tts._cache = None # reset cache
+                            print('252 failed! skipping this iteration')
+                            # raise e
 
-                if scaler is not None:
-                    # Unscales the gradients of optimizer's assigned params in-place
-                    for iopt, optimizer in enumerate(optimizers):
-                        if optim_idx is not None and iopt != optim_idx:
-                            continue
-                        scaler.unscale_(optimizer)
-
-                # TODO(kan-bayashi): Compute grad norm without clipping
-                grad_norm = None
-                if grad_clip > 0.0:
-                    # compute the gradient norm to check if it is normal or not
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_norm=grad_clip,
-                        norm_type=grad_clip_type,
-                    )
-                    # PyTorch<=1.4, clip_grad_norm_ returns float value
-                    if not isinstance(grad_norm, torch.Tensor):
-                        grad_norm = torch.tensor(grad_norm)
-
-                if grad_norm is None or torch.isfinite(grad_norm):
-                    all_steps_are_invalid = False
-                    with reporter.measure_time(f"{turn}_optim_step_time"):
-                        for iopt, (optimizer, scheduler) in enumerate(
-                            zip(optimizers, schedulers)
-                        ):
-                            if optim_idx is not None and iopt != optim_idx:
-                                continue
-                            if scaler is not None:
-                                # scaler.step() first unscales the gradients of
-                                # the optimizer's assigned params.
-                                scaler.step(optimizer)
-                                # Updates the scale for next iteration.
-                                scaler.update()
-                            else:
-                                optimizer.step()
-                            if isinstance(scheduler, AbsBatchStepScheduler):
-                                scheduler.step()
-                else:
-                    logging.warning(
-                        f"The grad norm is {grad_norm}. " "Skipping updating the model."
-                    )
-                    # Must invoke scaler.update() if unscale_() is used in the
-                    # iteration to avoid the following error:
-                    #   RuntimeError: unscale_() has already been called
-                    #   on this optimizer since the last update().
-                    # Note that if the gradient has inf/nan values,
-                    # scaler.step skips optimizer.step().
+                if not failed:
                     if scaler is not None:
+                        # Unscales the gradients of optimizer's assigned params in-place
                         for iopt, optimizer in enumerate(optimizers):
                             if optim_idx is not None and iopt != optim_idx:
                                 continue
-                            scaler.step(optimizer)
-                            scaler.update()
+                            scaler.unscale_(optimizer)
 
-                for iopt, optimizer in enumerate(optimizers):
-                    # NOTE(kan-bayashi): In the case of GAN, we need to clear
-                    #   the gradient of both optimizers after every update.
-                    optimizer.zero_grad()
+                    # TODO(kan-bayashi): Compute grad norm without clipping
+                    grad_norm = None
+                    if grad_clip > 0.0:
+                        # compute the gradient norm to check if it is normal or not
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(),
+                            max_norm=grad_clip,
+                            norm_type=grad_clip_type,
+                        )
+                        # PyTorch<=1.4, clip_grad_norm_ returns float value
+                        if not isinstance(grad_norm, torch.Tensor):
+                            grad_norm = torch.tensor(grad_norm)
 
-                # Register lr and train/load time[sec/step],
-                # where step refers to accum_grad * mini-batch
-                reporter.register(
-                    {
-                        f"optim{optim_idx}_lr{i}": pg["lr"]
-                        for i, pg in enumerate(optimizers[optim_idx].param_groups)
-                        if "lr" in pg
-                    },
-                )
-                reporter.register(
-                    {f"{turn}_train_time": time.perf_counter() - turn_start_time}
-                )
-                turn_start_time = time.perf_counter()
+                    if grad_norm is None or torch.isfinite(grad_norm):
+                        all_steps_are_invalid = False
+                        with reporter.measure_time(f"{turn}_optim_step_time"):
+                            for iopt, (optimizer, scheduler) in enumerate(
+                                zip(optimizers, schedulers)
+                            ):
+                                if optim_idx is not None and iopt != optim_idx:
+                                    continue
+                                if scaler is not None:
+                                    # scaler.step() first unscales the gradients of
+                                    # the optimizer's assigned params.
+                                    scaler.step(optimizer)
+                                    # Updates the scale for next iteration.
+                                    scaler.update()
+                                else:
+                                    optimizer.step()
+                                if isinstance(scheduler, AbsBatchStepScheduler):
+                                    scheduler.step()
+                    else:
+                        logging.warning(
+                            f"The grad norm is {grad_norm}. " "Skipping updating the model."
+                        )
+                        # Must invoke scaler.update() if unscale_() is used in the
+                        # iteration to avoid the following error:
+                        #   RuntimeError: unscale_() has already been called
+                        #   on this optimizer since the last update().
+                        # Note that if the gradient has inf/nan values,
+                        # scaler.step skips optimizer.step().
+                        if scaler is not None:
+                            for iopt, optimizer in enumerate(optimizers):
+                                if optim_idx is not None and iopt != optim_idx:
+                                    continue
+                                scaler.step(optimizer)
+                                scaler.update()
+
+                    for iopt, optimizer in enumerate(optimizers):
+                        # NOTE(kan-bayashi): In the case of GAN, we need to clear
+                        #   the gradient of both optimizers after every update.
+                        optimizer.zero_grad()
+
+                    # Register lr and train/load time[sec/step],
+                    # where step refers to accum_grad * mini-batch
+                    reporter.register(
+                        {
+                            f"optim{optim_idx}_lr{i}": pg["lr"]
+                            for i, pg in enumerate(optimizers[optim_idx].param_groups)
+                            if "lr" in pg
+                        },
+                    )
+                    reporter.register(
+                        {f"{turn}_train_time": time.perf_counter() - turn_start_time}
+                    )
+                    turn_start_time = time.perf_counter()
 
             reporter.register({"train_time": time.perf_counter() - start_time})
             start_time = time.perf_counter()

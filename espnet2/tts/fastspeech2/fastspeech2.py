@@ -774,6 +774,119 @@ class FastSpeech2(AbsTTS):
             energy=e_outs[0],
         )
 
+   
+    def _get_duration_pitch_energy(
+        self,
+        xs: torch.Tensor,
+        ilens: torch.Tensor,
+        ys: Optional[torch.Tensor] = None,
+        olens: Optional[torch.Tensor] = None,
+        ds: Optional[torch.Tensor] = None,
+        ps: Optional[torch.Tensor] = None,
+        es: Optional[torch.Tensor] = None,
+        spembs: Optional[torch.Tensor] = None,
+        sids: Optional[torch.Tensor] = None,
+        lids: Optional[torch.Tensor] = None,
+        is_inference: bool = False,
+        alpha: float = 1.0,
+    ) -> Sequence[torch.Tensor]:
+        # forward encoder
+        x_masks = self._source_mask(ilens)
+        hs, _ = self.encoder(xs, x_masks)  # (B, T_text, adim)
+
+        # integrate with GST
+        if self.use_gst:
+            style_embs = self.gst(ys)
+            hs = hs + style_embs.unsqueeze(1)
+
+        # integrate with SID and LID embeddings
+        if self.spks is not None:
+            sid_embs = self.sid_emb(sids.view(-1))
+            hs = hs + sid_embs.unsqueeze(1)
+        if self.langs is not None:
+            lid_embs = self.lid_emb(lids.view(-1))
+            hs = hs + lid_embs.unsqueeze(1)
+
+        # integrate speaker embedding
+        if self.spk_embed_dim is not None:
+            hs = self._integrate_with_spk_embed(hs, spembs)
+
+        # forward duration predictor and variance predictors
+        d_masks = make_pad_mask(ilens).to(xs.device)
+
+        if self.stop_gradient_from_pitch_predictor:
+            p_outs = self.pitch_predictor(hs.detach(), d_masks.unsqueeze(-1))
+        else:
+            p_outs = self.pitch_predictor(hs, d_masks.unsqueeze(-1))
+        if self.stop_gradient_from_energy_predictor:
+            e_outs = self.energy_predictor(hs.detach(), d_masks.unsqueeze(-1))
+        else:
+            e_outs = self.energy_predictor(hs, d_masks.unsqueeze(-1))
+
+        d_outs = self.duration_predictor.inference(hs, d_masks)  # (B, T_text)
+
+        return d_outs, p_outs, e_outs
+
+ def get_duration_pitch_energy(
+        self,
+        text: torch.Tensor,
+        feats: Optional[torch.Tensor] = None,
+        durations: Optional[torch.Tensor] = None,
+        spembs: torch.Tensor = None,
+        sids: Optional[torch.Tensor] = None,
+        lids: Optional[torch.Tensor] = None,
+        pitch: Optional[torch.Tensor] = None,
+        energy: Optional[torch.Tensor] = None,
+        alpha: float = 1.0,
+        use_teacher_forcing: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Generate the sequence of features given the sequences of characters.
+
+        Args:
+            text (LongTensor): Input sequence of characters (T_text,).
+            feats (Optional[Tensor): Feature sequence to extract style (N, idim).
+            durations (Optional[Tensor): Groundtruth of duration (T_text + 1,).
+            spembs (Optional[Tensor): Speaker embedding vector (spk_embed_dim,).
+            sids (Optional[Tensor]): Speaker ID (1,).
+            lids (Optional[Tensor]): Language ID (1,).
+            pitch (Optional[Tensor]): Groundtruth of token-avg pitch (T_text + 1, 1).
+            energy (Optional[Tensor]): Groundtruth of token-avg energy (T_text + 1, 1).
+            alpha (float): Alpha to control the speed.
+            use_teacher_forcing (bool): Whether to use teacher forcing.
+                If true, groundtruth of duration, pitch and energy will be used.
+
+        Returns:
+            Dict[str, Tensor]: Output dict including the following items:
+                * feat_gen (Tensor): Output sequence of features (T_feats, odim).
+                * duration (Tensor): Duration sequence (T_text + 1,).
+                * pitch (Tensor): Pitch sequence (T_text + 1,).
+                * energy (Tensor): Energy sequence (T_text + 1,).
+
+        """
+        x, y = text, feats
+        spemb, d, p, e = spembs, durations, pitch, energy
+
+        # add eos at the last of sequence
+        x = F.pad(x, [0, 1], "constant", self.eos)
+
+        # setup batch axis
+        ilens = torch.tensor([x.shape[0]], dtype=torch.long, device=x.device)
+        xs, ys = x.unsqueeze(0), None
+        if y is not None:
+            ys = y.unsqueeze(0)
+        if spemb is not None:
+            spembs = spemb.unsqueeze(0)
+
+        d_outs, p_outs, e_outs = self._get_duration_pitch_energy(
+            xs,ilens,ys,spembs=spembs,sids=sids,lids=lids,is_inference=True,alpha=alpha,)
+
+        return dict(
+            duration=d_outs[0],
+            pitch=p_outs[0],
+            energy=e_outs[0],
+        )
+    
+
     def _integrate_with_spk_embed(
         self, hs: torch.Tensor, spembs: torch.Tensor
     ) -> torch.Tensor:
